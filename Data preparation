@@ -1,0 +1,137 @@
+## Load packages
+library(tidyr)
+round_any<-plyr::round_any
+library(dplyr)
+library(stringr)
+library(lubridate)
+
+## Load data
+austin.raw<-read.csv("File.directory")
+
+### Data Preparation
+# Limit data to year 2018
+austin.raw=austin.raw[austin.raw$Year=="2018",]
+# Remove speed values of 149 as there are a suspicously huge amount of this registered speed, despite it being incredibly fast.
+ukler= austin.raw[austin.raw$Speed!=149,]
+#Remove Toomeytest as there are very few points here, and the name implies that it is not a proper data collection
+ukler= ukler[ukler$KITS.ID!="18",] ukler[,"Minute"]=round_any(ukler[,"Minute"],15,f=floor)
+#Convert "60" in Time.Bin to "00"
+ukler[c('Time', 'Bin')] <- str_split_fixed(ukler$Time.Bin, ':', 2)
+ukler[ukler$Bin=="60","Bin"]="00"
+ukler=ukler %>% unite(Time.Bin,Time,Bin,sep=':',remove=TRUE)
+# Convert speed to kmh instead of mph
+ukler[,"Speed"]<-ukler[,"Speed"]*1.60934
+
+# Aggregate Volume and Speed
+ikler=ukler %>% unite(Imp,KITS.ID,Intersection.Name,Year,Month,Day,Time.Bin,Day.of.Week, sep='/', remove=TRUE)
+agg.vol <- aggregate(x = ikler$Volume, by = list(ikler$Imp), FUN = sum)
+agg.spe <- aggregate(x = ikler$Speed, by = list(ikler$Imp), FUN = mean)
+agg.volspe <- cbind(agg.vol,agg.spe)
+colnames(agg.volspe)=c('Imp','Volume','Imp.Again','Speed')
+all(agg.volspe[,"Imp"]==agg.volspe[,"Imp.Again"]) # Should be TRUE, otherwise there is an issue
+agg.volspe[c('KITS.ID','Intersection.Name','Year','Month','Day','Time.Bin','Day.of.Week')] <- str_split_fixed(agg.volspe$Imp,'/',7)
+austin <- agg.volspe[,c('KITS.ID','Intersection.Name','Volume','Speed','Year','Month','Day','Time.Bin','Day.of.Week')]
+rnd <- function(x) trunc(x+sign(x)*0.5) # I use this because round() goes toward even numbers, for some reason.
+austin[,"Volume"] <- rnd(austin[,"Volume"])
+austin[,"Speed"] <- rnd(austin[,"Speed"])
+
+# Define and add speed limits of each road segment to the data
+speedlimits=data.frame(KITS.ID=as.character(sort(unique(as.numeric(austin[,"KITS.ID"])))), Speed.Limit=c(56,56,56,56,97,97,56,72,48,64,56,56,48,56,56,72,89,64))
+austin=merge(austin,speedlimits,by="KITS.ID")
+
+# Combine the time point relevant data to get collection times in single column on a format that is compatible with "as.POSIXlt()".
+austin[c('Hour','Minute')] <- str_split_fixed(austin$Time.Bin,':',2)
+austin=cbind(austin,sec=c("00"))
+austin=austin %>% unite(Time.Bin,Time.Bin,sec, sep=':', remove=TRUE)
+austin=austin %>% unite(Date,Year,Month,Day, sep='-', remove=FALSE)
+austin[,"Date"]=as.character(as.POSIXlt(austin[,"Date"]))
+austin=austin %>% unite(Time,Date,Time.Bin, sep=' ', remove=TRUE)
+
+# Determine the traffic densities from the "Volume" and "Speed" data.
+austin[austin$Speed==0,"Speed"]=1
+densers=(austin[,"Volume"]*4)/austin[,"Speed"]
+austin=cbind(austin,Density=round(densers))
+
+
+### Adding congestion indices to data set
+# First define fuzzy inference system
+library(sets) # For setting up fuzzy inference system
+# Fuzzy sets
+# maximum speed in universe of discourse
+spemax=max(austin[,"Speed"])
+# Different fuzzy sets depending on speed limit
+spee=list("48"=c(0,11,28,37,46,55,spemax),"56"=c(0,13,32,43,54,64,spemax),"64"=c(0,15,37,49,61,74,spemax),"72"=c(0,17,41,55,67,83,spemax),"89"=c(0,21,51,67,84,101,spemax),"97"=c(0,23,55,74,92,110,spemax))
+# Sequence representing universe of discourse for speed
+speseq=seq(0,spemax,1)
+# maximum density in universe of discourse
+denmax=max(austin[,"Density"])
+# fuzzy set for density
+den=c(0,7,20,30,45,60,denmax)
+# Sequence representing universe of discourse for densityy
+denseq=seq(0,denmax,1)
+# fuzzy set for congestion index
+con=c(0,0.1,0.3,0.5,0.7,0.9,1)  # (dummy, very_light , light , moderate , heavy , very_heavy ,dummy)
+# Sequence representing universe of discourse for congestion index
+conseq=seq(con[1],con[7],0.001)
+
+# Fuzzy rules
+rules <- set(
+  fuzzy_rule(density %is% very_high && speed %is% very_slow, congestion %is% very_heavy),
+  fuzzy_rule(density %is% very_high && speed %is% slow, congestion %is% very_heavy),
+  fuzzy_rule(density %is% very_high && speed %is% medium, congestion %is% heavy),
+  fuzzy_rule(density %is% very_high && speed %is% fast, congestion %is% heavy),### These hashtags mean that I have added this rule myself
+  fuzzy_rule(density %is% very_high && speed %is% very_fast, congestion %is% moderate),###
+  fuzzy_rule(density %is% high && speed %is% very_slow, congestion %is% very_heavy),
+  fuzzy_rule(density %is% high && speed %is% slow, congestion %is% heavy),
+  fuzzy_rule(density %is% high && speed %is% medium, congestion %is% heavy),
+  fuzzy_rule(density %is% high && speed %is% fast, congestion %is% moderate),
+  fuzzy_rule(density %is% high && speed %is% very_fast, congestion %is% moderate),###
+  fuzzy_rule(density %is% medium && speed %is% very_slow, congestion %is% heavy),
+  fuzzy_rule(density %is% medium && speed %is% slow, congestion %is% moderate),
+  fuzzy_rule(density %is% medium && speed %is% medium, congestion %is% moderate),
+  fuzzy_rule(density %is% medium && speed %is% fast, congestion %is% moderate),
+  fuzzy_rule(density %is% medium && speed %is% very_fast, congestion %is% light),
+  fuzzy_rule(density %is% low && speed %is% very_slow, congestion %is% very_heavy),####
+  fuzzy_rule(density %is% low && speed %is% slow, congestion %is% moderate),
+  fuzzy_rule(density %is% low && speed %is% medium, congestion %is% light),
+  fuzzy_rule(density %is% low && speed %is% fast, congestion %is% light),
+  fuzzy_rule(density %is% low && speed %is% very_fast, congestion %is% very_light),
+  fuzzy_rule(density %is% very_low && speed %is% very_slow, congestion %is% very_heavy),###
+  fuzzy_rule(density %is% very_low && speed %is% slow, congestion %is% very_heavy),###
+  fuzzy_rule(density %is% very_low && speed %is% medium, congestion %is% light),
+  fuzzy_rule(density %is% very_low && speed %is% fast, congestion %is% very_light),
+  fuzzy_rule(density %is% very_low && speed %is% very_fast, congestion %is% very_light)
+)
+
+#Determine the congestion indices at each data point
+congersne=data.frame(Speed.Limit=0,Speed=0,Density=0,Congestion=0)
+# Warning: might take a while. I suggest you run this before you go to bed :)
+for (i in unique(as.character(austin[,"Speed.Limit"]))) {
+  spe=spee[[i]]
+  variables <- set(
+    density = fuzzy_variable(very_low=fuzzy_trapezoid_gset(c(den[1]-1,den[1],den[2],den[3]),universe=denseq),low = fuzzy_triangular_gset(c(den[2],den[3],den[4]),universe=denseq), medium = fuzzy_triangular_gset(c(den[3],den[4],den[5]),universe=denseq), high = fuzzy_triangular_gset(c(den[4],den[5],den[6]),universe=denseq), very_high = fuzzy_trapezoid_gset(c(den[5],den[6],den[7],den[7]+1),universe = denseq)),
+    speed = fuzzy_variable(very_slow=fuzzy_trapezoid_gset(c(spe[1]-1,spe[1],spe[2],spe[3]),universe=speseq), slow = fuzzy_triangular_gset(c(spe[2],spe[3],spe[4]),universe=speseq), medium = fuzzy_triangular_gset(c(spe[3],spe[4],spe[5]),universe=speseq), fast = fuzzy_triangular_gset(c(spe[4],spe[5],spe[6]),universe=speseq), very_fast = fuzzy_trapezoid_gset(c(spe[5],spe[6],spe[7],spe[7]+1),universe=speseq)),
+    congestion = fuzzy_variable(very_light = fuzzy_trapezoid_gset(c(con[1]-1,con[1],con[2],con[3]),universe=conseq),light = fuzzy_triangular_gset(c(con[2],con[3],con[4]),universe=conseq), moderate = fuzzy_triangular_gset(c(con[3],con[4],con[5]),universe=conseq), heavy = fuzzy_triangular_gset(c(con[4],con[5],con[6]),universe=conseq), very_heavy = fuzzy_trapezoid_gset(c(con[5],con[6],con[7],con[7]+1),universe=conseq))
+  )
+  model <- fuzzy_system(variables,rules)
+  for (j in unique(austin2018[austin2018$Speed.Limit==i,"Speed"])) {
+    print(i)
+    for (k in unique(austin2018[austin2018$Speed.Limit==i & austin2018$Speed==j,"Density"])) {
+      congen=gset_defuzzify(fuzzy_inference(model, list(density = k, speed = j), implication = "minimum"),"centroid")
+      congersne=rbind(congersne,c(as.numeric(i),j,k,congen))
+    }
+  }
+}
+# Adding the congestion to the data set
+# Might take 20-30 minutes of run time
+for (i in 1:nrow(austin2018)) {
+  sp=austin[i,"Speed"]
+  de=austin[i,"Density"]
+  li=austin[i,"Speed.Limit"]
+  austin[i,"Congestion"]<-congersne[congersne$Speed==sp & congersne$Density==de & congersne$Speed.Limit==li,"Congestion"]
+}
+
+#Getting some road segment lengths
+le=round(runif(length(unique(austin[,"KITS.ID"])),min = 5, max = 10))
+le=c(7,7,9,5,9,10,9,8,9,8,8,6,8,7,6,7,5,8) # the segment lengths used in the project
+seglen=data.frame(KITS.ID=unique(austin[,"KITS.ID"]), Length=le)
