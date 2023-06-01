@@ -1,0 +1,435 @@
+
+# Use either travel time or fuel consumption as objective parameter
+# fuel consumption
+obj=fuelobj
+bobj=fuelbobj
+# travel time
+obj=travobj
+bobj=travbobj
+
+# set seed
+set.seed(63)
+# data frames for containing benchmark results
+congy_teng=data.frame(e=0,Time="NA",route="NA",objective=0,cong.route="NA",cong.objective=0,avg.congestion=0)
+congy_diff=data.frame(e=0,Time="NA",route="NA",objective=0,cong.route="NA",real.cong.objective=0,cong.objective=0,avg.congestion=0)
+avg.congest.cong=c()
+# data frames for containing benchmark results
+benchy_teng=data.frame(e=0,Time="NA",route="NA",objective=0,bench.route="NA",bench.objective=0,avg.congestion=0)
+benchy_diff=data.frame(e=0,Time="NA",route="NA",objective=0,bench.route="NA",real.bench.objective=0,bench.objective=0,avg.congestion=0)
+avg.congest.bench=c()
+
+cap=2 # Forecast up to 2 hours
+stime=Sys.time()
+for (e in 1:500) {
+  ## Specify which hours of the day to test on
+  HH=sample(unique(austin[,"Hour"]),1)
+  #HH=sample(c("06","07","08","15","16","17","18"),1) #From both rush hours
+  #HH=sample(unique(austin[austin$Hour%!in%c("06","07","08","15","16","17","18"),"Hour"]),1)#Outside rush hour
+  #HH=sample(c("06","07","08"),1)#Morning rush hours
+  #HH=sample(c("15","16","17","18"),1)#evening rush hours
+  #HH=sample(c("09","10","11","12","13","14"),1) #between rush hours
+  
+  # Random pick start time of test
+  tim=sample(unique(austin[austin$Hour==HH,"Time"]),1)
+  
+  # Pull out data at time tim
+  aus=austin[austin$Time==tim,]
+  # If there is not enough nodes at time tim, then another time is picked
+  if (nrow(aus)<=2){
+    while (nrow(aus)<=2){
+      tim=sample(unique(austin[austin$Hour==HH,"Time"]),1)
+      aus=austin[austin$Time==tim,]
+    }
+  }
+  
+  #Random start and destination point of route
+  start=sample(aus[,"KITS.ID"],1)
+  end=sample(aus[-which(aus[,"KITS.ID"]==start),"KITS.ID"],1)
+  
+  # Make random network
+  ki=sort(as.integer(unique(aus[,"KITS.ID"])))
+  ki=as.character(ki)
+  # Decide arc probability
+  kai=random.graph(ki,prob=0.30)
+  #kai=random.graph(ki,prob=0.10)
+  #kai=random.graph(ki,prob=0.50)
+  #kai=random.graph(ki,prob=1)
+  kaircs=kai$arcs
+  
+  # For removing direct arc between start and destination node
+  bl=set2blacklist(c(start,end))
+  for (i in 1:nrow(kaircs)) {
+    if (all(kaircs[i,]==bl[1,]) | all(kaircs[i,]==bl[2,])){
+      kaircs=kaircs[-i,]
+      break
+    }
+  }
+  # Make the arcs undirected
+  if (length(kaircs)<=2){
+    naircs=rbind(kaircs,kaircs[c(2,1)])
+  }else{
+    naircs=rbind(kaircs,kaircs[,c('to','from')])
+  }
+  arcs(kai)=naircs
+  #plot network
+  graphviz.plot(kai,layout = "circo",sub=e)
+  
+  
+  ##Forecasting the density and avg speed for each segment 
+  prevs=as.character(as.POSIXlt(tim)-c(15,30)*60)
+  paus=austin[austin$Time%in%append(tim,prevs),]
+  for (i in 1:(cap*4)) {
+    nowr=as.character(format(as.POSIXlt(tim)+15*i*60,"%Y-%m-%d %H:%M:%S"))
+    prevs=as.character(as.POSIXlt(nowr)-c(15,30,45)*60)
+    for (j in unique(aus[,"KITS.ID"])) {
+      doa=3*tens(j,prevs[1])+2*tens(j,prevs[2])+1*tens(j,prevs[3])
+      soa=3*spens(j,prevs[1])+2*spens(j,prevs[2])+1*spens(j,prevs[3])
+      coa=3*ceng(j,prevs[1])+2*ceng(j,prevs[2])+1*ceng(j,prevs[3])
+      forden=round((doa)/(3+2+1))
+      forspe=round((soa)/(3+2+1))
+      forcon=coa/(3+2+1)
+      if(length(forden)>1){
+        break
+      }
+      
+      newlywed=aus[aus$KITS.ID==j,][1,]
+      newlywed[,"Speed"]=forspe
+      newlywed[,"Density"]=forden
+      newlywed[,"Time"]=nowr
+      newlywed[,"Volume"]=NA
+      newlywed[,"Congestion"]=forcon
+      paus=rbind(paus,newlywed)
+    }
+    if (length(forden)>1){break}
+  }
+  if (any(is.na(paus[,"Speed"]))){
+    next
+  }
+  if (length(forden)>1){next}
+  
+  ## Bechmark routing
+  # Data.frame for measures
+  bistances<-data.frame(node=ki,bench.route=rep(NA,length(ki)),bench.obj=rep(Inf,length(ki)),bench.travel=NA,sumcongestion=NA)
+  bistances[bistances[,1]==start,"bench.route"]=start
+  bistances[bistances[,1]==start,"bench.obj"]=0
+  bistances[bistances[,1]==start,"bench.travel"]=0
+  bistances[bistances[,1]==start,"sumcongestion"]=0
+  # Vector to keep track of visited nodes
+  bisited=c()
+  for (i in (1:length(ki))) {
+    # Check node with lowest function value
+    vis=bistances[bistances$bench.obj==min(bistances[bistances$node %!in% bisited,"bench.obj"]) & bistances$node %!in% bisited,][,"node"][1]
+    #Determine time point at vis
+    nowr=as.character(format(floor_date(as.POSIXlt(tim)+bistances[bistances$node==vis,"bench.travel"],"15 minutes"),"%Y-%m-%d %H:%M:%S"))
+    # Cancel if the is no path connecting start and destination node
+    if (min(bistances[bistances$node %!in% bisited,"bench.obj"])==Inf){
+      bistances[bistances$node==vis,"bench.route"]="No route"
+      boute=bistances[bistances$node==vis,]
+      break
+    }
+    #Just to check if the travel time exceeds the latest forecast
+    if (as.POSIXlt(nowr)>as.POSIXlt(tim)+cap*60*60){
+      print(c("bench Længere end",cap))
+      print(tim)
+      print(nowr)
+      print("capped")
+      nowr=as.character(format(as.POSIXlt(tim)+cap*60*60),"%Y-%m-%d %H:%M:%S")
+    }
+    # Stop when destination node is chosen
+    if (vis==end){
+      boute=bistances[bistances$node==end,]
+      break
+    }
+    # Find neighbooring nodes
+    if (length(naircs[naircs[,'from']==vis,])<=2){
+      nex=naircs[naircs[,'from']==vis,]['to']
+    }
+    if (length(naircs[naircs[,'from']==vis,])>2){
+      nex=naircs[naircs[,'from']==vis,][,'to']
+    }
+    # If start node is isolated then cancel
+    if (any(is.na(nex))){
+      bistances[bistances$node==vis,"bench.route"]="No route"
+      boute=bistances[bistances$node==vis,]
+      break
+    }
+    # Find congestion and value of each road segment connecting current node to neighbooring nodes.
+    # and check if new shortest path have been found.
+    for (j in nex) {
+      conge=paus[paus$Time==nowr & paus$KITS.ID==j,"Congestion"]
+      speedopts=paus[paus$Time==nowr & paus[,"KITS.ID"]==j,"Speed"]
+      for (v in speedopts) {
+        val=bobj(v,j)
+        if (bistances[bistances$node==vis,][,"bench.obj"]+val < bistances[bistances$node==j,][,"bench.obj"]){
+          bistances[bistances$node==j,][,"bench.obj"]=bistances[bistances$node==vis,][,"bench.obj"]+val
+          bistances[bistances$node==j,][,"bench.route"]=toString(append(bistances[bistances$node==vis,"bench.route"],j))
+          bistances[bistances$node==j,][,"bench.travel"]=bistances[bistances$node==vis,][,"bench.travel"]+trav(v,j)*60*60
+          bistances[bistances$node==j,][,"sumcongestion"]=bistances[bistances$node==vis,][,"sumcongestion"]+conge
+        }
+      }
+    }
+    bisited=append(bisited,vis)
+    #etime=Sys.time()
+  }
+  # If no path was found, then on to next iteration.
+  if (boute[["bench.route"]]=="No route"){
+    print("No route")
+    next
+  }
+  bou=as.character(as.numeric(strsplit(as.character(boute["bench.route"]),",")[[1]]))
+  
+  
+  ## Target Benchmark
+  # Data.frame for measures
+  bistances<-data.frame(node=ki,bench.route=rep(NA,length(ki)),bench.obj=rep(Inf,length(ki)),bench.travel=NA,sumcongestion=NA)
+  bistances[bistances[,1]==start,"bench.route"]=start
+  bistances[bistances[,1]==start,"bench.obj"]=0
+  bistances[bistances[,1]==start,"bench.travel"]=0
+  bistances[bistances[,1]==start,"sumcongestion"]=0
+  # Vector to keep track of visited nodes
+  bisited=c()
+  for (i in (1:length(ki))) {
+    # Check node with lowest function value
+    vis=bistances[bistances$bench.obj==min(bistances[bistances$node %!in% bisited,"bench.obj"]) & bistances$node %!in% bisited,][,"node"][1]
+    #Determine time point at vis
+    nowr=as.character(format(floor_date(as.POSIXlt(tim)+bistances[bistances$node==vis,"bench.travel"],"15 minutes"),"%Y-%m-%d %H:%M:%S"))
+    # Cancel if the is no path connecting start and destination node
+    if (min(bistances[bistances$node %!in% bisited,"bench.obj"])==Inf){
+      bistances[bistances$node==vis,"bench.route"]="No route"
+      gboute=bistances[bistances$node==vis,]
+      break
+    }
+    #Just to check if the travel time exceeds the latest forecast
+    if (as.POSIXlt(nowr)>as.POSIXlt(tim)+cap*60*60){
+      print(c("bench Længere end",cap))
+      print(tim)
+      print(nowr)
+      print("capped")
+      nowr=as.character(format(as.POSIXlt(tim)+cap*60*60),"%Y-%m-%d %H:%M:%S")
+    }
+    # Stop when destination node is chosen
+    if (vis==end){
+      gboute=bistances[bistances$node==end,]
+      break
+    }
+    # Find neighbooring nodes
+    if (length(naircs[naircs[,'from']==vis,])<=2){
+      nex=naircs[naircs[,'from']==vis,]['to']
+    }
+    if (length(naircs[naircs[,'from']==vis,])>2){
+      nex=naircs[naircs[,'from']==vis,][,'to']
+    }
+    # Find congestion and value of each road segment connecting current node to neighbooring nodes.
+    # and check if new shortest path have been found.
+    for (j in nex) {
+      conge=paus[paus$Time==nowr & paus$KITS.ID==j,"Congestion"]
+      speedopts=greenshield(paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==j,"Speed.Limit"],paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==j,"Density"])
+      for (v in speedopts) {
+        val=bobj(v,j)
+        if (bistances[bistances$node==vis,][,"bench.obj"]+val < bistances[bistances$node==j,][,"bench.obj"]){
+          bistances[bistances$node==j,][,"bench.obj"]=bistances[bistances$node==vis,][,"bench.obj"]+val
+          bistances[bistances$node==j,][,"bench.route"]=toString(append(bistances[bistances$node==vis,"bench.route"],j))
+          bistances[bistances$node==j,][,"bench.travel"]=bistances[bistances$node==vis,][,"bench.travel"]+trav(v,j)*60*60
+          bistances[bistances$node==j,][,"sumcongestion"]=bistances[bistances$node==vis,][,"sumcongestion"]+conge
+        }
+      }
+    }
+    bisited=append(bisited,vis)
+  }
+  # If no path was found, then on to next iteration.
+  if (gboute[["bench.route"]]=="No route"){
+    print("No route")
+    next
+  }
+  gbou=as.character(as.numeric(strsplit(as.character(gboute["bench.route"]),",")[[1]]))
+  
+  #Check if benchmark and target discovers different routes
+  if (all(bou==gbou)==FALSE){
+    benchmark.obj=0
+    for (i in bou[-1]) {
+      nowr=as.character(format(floor_date(as.POSIXlt(tim)+benchmark.travel,"15 minutes"),"%Y-%m-%d %H:%M:%S"))
+      if (as.POSIXlt(nowr)>as.POSIXlt(tim)+cap*60*60){
+        print(c("benchmark Længere end",cap))
+        print(tim)
+        print(nowr)
+        print("reset")
+        nowr=as.character(format(as.POSIXlt(tim)+cap*60*60),"%Y-%m-%d %H:%M:%S")
+      }
+      conge=paus[paus$Time==nowr & paus$KITS.ID==i,"Congestion"]
+      oh=bobj(greenshield(paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==i,"Speed.Limit"],paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==i,"Density"]),i)
+      benchmark.obj=benchmark.obj+oh
+    }
+    #Save measures for benchmark and target at different routes
+    benchy_diff=rbind(benchy_diff,c(e,tim,gboute[["bench.route"]],gboute[["bench.obj"]],boute[["bench.route"]],benchmark.obj,boute[["bench.obj"]],(((boute[["sumcongestion"]]/(length(bou)-1))-(gboute[["sumcongestion"]]/(length(gbou)-1)))/(gboute[["sumcongestion"]]/(length(gbou)-1)))))
+  }
+  #Save measures for benchmark and target
+  benchy_teng=rbind(benchy_teng,c(e,tim,gboute[["bench.route"]],gboute[["bench.obj"]],boute[["bench.route"]],boute[["bench.obj"]],boute[["sumcongestion"]]/(length(bou)-1)))
+  
+  
+  ## Proposed method ##
+  # Data.frame for measures
+  distances<-data.frame(node=ki, route=rep(NA,length(ki)), objective=rep(Inf,length(ki)),travel.time=NA, sumcongestion=NA)
+  distances[distances[,1]==start,"objective"]=0
+  distances[distances[,1]==start,"route"]=start
+  distances[distances[,1]==start,"travel.time"]=0
+  distances[distances[,1]==start,"sumcongestion"]=0
+  # Vector to keep track of visited nodes
+  visited=c()
+  
+  for (i in (1:length(ki))) {
+    # Choose node with lowest function value
+    vis=distances[distances$objective==min(distances[distances$node %!in% visited,"objective"])& distances$node %!in% visited,][,"node"][1]
+    #Determine time point at vis
+    nowr=as.character(format(floor_date(as.POSIXlt(tim)+distances[distances$node==vis,"travel.time"],"15 minutes"),"%Y-%m-%d %H:%M:%S"))
+    #Just to check if the travel time exceeds the latest forecast
+    if (as.POSIXlt(nowr)>as.POSIXlt(tim)+cap*60*60){
+      print(c("Længere end",cap))
+      print(tim)
+      print(nowr)
+      print("capped")
+      nowr=as.character(format(as.POSIXlt(tim)+cap*60*60),"%Y-%m-%d %H:%M:%S")
+    }
+    if (vis==end){
+      route=distances[distances$node==end,]
+      break
+    }
+    # Find neighbooring nodes
+    if (length(naircs[naircs[,'from']==vis,])<=2){
+      nex=naircs[naircs[,'from']==vis,]['to']
+    }
+    if (length(naircs[naircs[,'from']==vis,])>2){
+      nex=naircs[naircs[,'from']==vis,][,'to']
+    }
+    # Find congestion and value of each road segment connecting current node to neighboring nodes.
+    # and check if new shortest path have been found.
+    for (j in nex) {
+      conge=paus[paus$Time==nowr & paus$KITS.ID==j,"Congestion"]
+      speedopts=paus[paus$Time==nowr & paus[,"KITS.ID"]==j,"Speed"]
+      for (v in speedopts){
+        of=obj(v,j)
+        val=of
+        if (distances[distances$node==vis,][,"objective"]+val < distances[distances$node==j,][,"objective"]){
+          distances[distances$node==j,][,"route"]=toString(append(distances[distances$node==vis,"route"],j))
+          distances[distances$node==j,][,"objective"]=distances[distances$node==vis,][,"objective"]+val
+          distances[distances$node==j,][,"travel.time"]=distances[distances$node==vis,][,"travel.time"]+travobj(v,j)
+          distances[distances$node==j,][,"sumcongestion"]=distances[distances$node==vis,][,"sumcongestion"]+conge
+        }
+      }
+    }
+    visited=append(visited,vis)
+  }
+  
+  rou=as.character(as.numeric(strsplit(as.character(route["route"]),",")[[1]]))
+  
+  
+  
+  ## Target Proposed method ##
+  # Data.frame for measures
+  distances<-data.frame(node=ki, route=rep(NA,length(ki)), objective=rep(Inf,length(ki)),travel.time=NA, sumcongestion=NA)
+  distances[distances[,1]==start,"objective"]=0
+  distances[distances[,1]==start,"route"]=start
+  distances[distances[,1]==start,"travel.time"]=0
+  distances[distances[,1]==start,"sumcongestion"]=0
+  # Vector to keep track of visited nodes
+  visited=c()
+  
+  for (i in (1:length(ki))) {
+    # Choose node with lowest function value
+    vis=distances[distances$objective==min(distances[distances$node %!in% visited,"objective"])& distances$node %!in% visited,][,"node"][1]
+    #Determine time point at vis
+    nowr=as.character(format(floor_date(as.POSIXlt(tim)+distances[distances$node==vis,"travel.time"],"15 minutes"),"%Y-%m-%d %H:%M:%S"))
+    #Just to check if the travel time exceeds the latest forecast
+    if (as.POSIXlt(nowr)>as.POSIXlt(tim)+cap*60*60){
+      print(c("Længere end",cap))
+      print(tim)
+      print(nowr)
+      print("capped")
+      nowr=as.character(format(as.POSIXlt(tim)+cap*60*60),"%Y-%m-%d %H:%M:%S")
+    }
+    if (vis==end){
+      groute=distances[distances$node==end,]
+      break
+    }
+    # Find neighbooring nodes
+    if (length(naircs[naircs[,'from']==vis,])<=2){
+      nex=naircs[naircs[,'from']==vis,]['to']
+    }
+    if (length(naircs[naircs[,'from']==vis,])>2){
+      nex=naircs[naircs[,'from']==vis,][,'to']
+    }
+    # Find congestion and value of each road segment connecting current node to neighboring nodes.
+    # and check if new shortest path have been found.
+    for (j in nex) {
+      conge=paus[paus$Time==nowr & paus$KITS.ID==j,"Congestion"]
+      speedopts=greenshield(paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==j,"Speed.Limit"],paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==j,"Density"])
+      for (v in speedopts){
+        val=obj(v,j)
+        if (distances[distances$node==vis,][,"objective"]+val < distances[distances$node==j,][,"objective"]){
+          distances[distances$node==j,][,"route"]=toString(append(distances[distances$node==vis,"route"],j))
+          distances[distances$node==j,][,"objective"]=distances[distances$node==vis,][,"objective"]+val
+          distances[distances$node==j,][,"travel.time"]=distances[distances$node==vis,][,"travel.time"]+travobj(v,j)
+          distances[distances$node==j,][,"sumcongestion"]=distances[distances$node==vis,][,"sumcongestion"]+conge
+        }
+      }
+    }
+    visited=append(visited,vis)
+  }
+  grou=as.character(as.numeric(strsplit(as.character(groute["route"]),",")[[1]]))
+  
+  ###############################
+  #Check if benchmark and target discovers different routes
+  if (all(bou==gbou)==FALSE){
+    benchmark.obj=0
+    for (i in bou[-1]) {
+      nowr=as.character(format(floor_date(as.POSIXlt(tim)+benchmark.travel,"15 minutes"),"%Y-%m-%d %H:%M:%S"))
+      if (as.POSIXlt(nowr)>as.POSIXlt(tim)+cap*60*60){
+        print(c("benchmark Længere end",cap))
+        print(tim)
+        print(nowr)
+        print("reset")
+        nowr=as.character(format(as.POSIXlt(tim)+cap*60*60),"%Y-%m-%d %H:%M:%S")
+      }
+      conge=paus[paus$Time==nowr & paus$KITS.ID==i,"Congestion"]
+      oh=bobj(greenshield(paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==i,"Speed.Limit"],paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==i,"Density"]),i)
+      benchmark.obj=benchmark.obj+oh
+    }
+    #Save measures for benchmark and target at different routes
+    benchy_diff=rbind(benchy_diff,c(e,tim,gboute[["bench.route"]],gboute[["bench.obj"]],boute[["bench.route"]],benchmark.obj,boute[["bench.obj"]],(((boute[["sumcongestion"]]/(length(bou)-1))-(gboute[["sumcongestion"]]/(length(gbou)-1)))/(gboute[["sumcongestion"]]/(length(gbou)-1)))))
+  }
+  #Save measures for benchmark and target
+  benchy_teng=rbind(benchy_teng,c(e,tim,gboute[["bench.route"]],gboute[["bench.obj"]],boute[["bench.route"]],boute[["bench.obj"]],boute[["sumcongestion"]]/(length(bou)-1)))
+  ##########################
+  
+  
+  #Check if proposed method and target discovers different routes
+  if (all(rou==grou)==FALSE){
+    cong.obj=0
+    #cong.sum.con=0
+    for (i in rou[-1]) {
+      nowr=as.character(format(floor_date(as.POSIXlt(tim)+benchmark.travel,"15 minutes"),"%Y-%m-%d %H:%M:%S"))
+      if (as.POSIXlt(nowr)>as.POSIXlt(tim)+cap*60*60){
+        nowr=as.character(format(as.POSIXlt(tim)+cap*60*60),"%Y-%m-%d %H:%M:%S")
+      }
+      conge=paus[paus$Time==nowr & paus$KITS.ID==i,"Congestion"]
+      of=obj(greenshield(paus[paus[,"Time"]==nowr & paus[,"KITS.ID"]==i,"Speed.Limit"],paus[paus["Time"]==nowr & paus[,"KITS.ID"]==i,"Density"]),i)
+      cong.obj=cong.obj+of
+    }
+    # Save measures for proposed method and target at different routes
+    congy_diff=rbind(congy_diff,c(e,tim,groute[["route"]],groute[["objective"]],route[["route"]],cong.obj,route[["objective"]],(((route[["sumcongestion"]]/(length(rou)-1))-(groute[["sumcongestion"]]/(length(grou)-1)))/(groute[["sumcongestion"]]/(length(grou)-1)))))
+  }
+  # Save measures for proposed method and target at different routes
+  congy_teng=rbind(congy_teng,c(e,tim,groute[["route"]],groute[["objective"]],route[["route"]],route[["objective"]],route[["sumcongestion"]]/(length(rou)-1)))
+  
+  if(all(rou==bou)==FALSE){
+    avg.congest.cong=append(avg.congest.cong,route[["sumcongestion"]]/(length(rou)-1))
+    avg.congest.bench=append(avg.congest.bench,boute[["sumcongestion"]]/(length(bou)-1))
+  }
+  
+  etime=Sys.time()
+}
+etime-stime # Runtime
+
+# Average results
+avg.res=data.frame(Percentage_different_routes_proposed=((nrow(congy_diff)-1)/(nrow(congy_teng)-1))*100,Percentage_different_routes_benchmark=((nrow(benchy_diff)-1)/(nrow(benchy_teng)-1))*100,Percentage_inaccuracy_proposed=mean(((as.numeric(congy_diff[-1,"cong.objective"])-as.numeric(congy_diff[-1,"objective"]))/as.numeric(congy_diff[-1,"objective"]))*100),Percentage_inaccuracy_benchmark=mean(((as.numeric(benchy_diff[-1,"bench.objective"])-as.numeric(benchy_diff[-1,"objective"]))/as.numeric(benchy_diff[-1,"objective"]))*100))
+avg.res
+
