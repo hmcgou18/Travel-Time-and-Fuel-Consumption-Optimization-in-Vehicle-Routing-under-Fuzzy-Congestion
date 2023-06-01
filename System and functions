@@ -1,0 +1,159 @@
+# Load the data from repository
+load(file="austin_data.Rdata")
+
+#Getting some road segment lengths
+le=round(runif(length(unique(austin[,"KITS.ID"])),min = 5, max = 10))
+#le=c(7,7,9,5,9,10,9,8,9,8,8,6,8,7,6,7,5,8) # the segment lengths used in the project
+seglen=data.frame(KITS.ID=unique(austin[,"KITS.ID"]), Length=le)
+
+# Load packages
+library(tidyr)
+round_any<-plyr::round_any
+library(dplyr)
+library(stringr)
+library(lubridate)
+
+library(sets) # For setting up fuzzy inference system
+## install and load packages for creating random network
+install.packages("https://www.bnlearn.com/releases/bnlearn_latest.tar.gz", repos = NULL, type = "source")
+library(bnlearn)
+install.packages("BiocManager")
+BiocManager::install("Rgraphviz")
+
+
+
+### Fuzzy inference system
+
+# Fuzzy sets
+spemax=max(austin[,"Speed"])
+spee=list("48"=c(0,11,28,37,46,55,spemax),"56"=c(0,13,32,43,54,64,spemax),"64"=c(0,15,37,49,61,74,spemax),"72"=c(0,17,41,55,67,83,spemax),"89"=c(0,21,51,67,84,101,spemax),"97"=c(0,23,55,74,92,110,spemax))
+speseq=seq(0,spemax,1)
+denmax=max(austin[,"Density"])
+den=c(0,7,20,30,45,60,denmax) # (dummy, very_low , low , medium , high , very_high ,dummy)
+denseq=seq(0,denmax,1)
+con=c(0,0.1,0.3,0.5,0.7,0.9,1)  # (dummy, very_light , light , moderate , heavy , very_heavy ,dummy)
+conseq=seq(con[1],con[7],0.001)
+
+# Fuzzy rules
+rules <- set(
+  fuzzy_rule(density %is% very_high && speed %is% very_slow, congestion %is% very_heavy),
+  fuzzy_rule(density %is% very_high && speed %is% slow, congestion %is% very_heavy),
+  fuzzy_rule(density %is% very_high && speed %is% medium, congestion %is% heavy),
+  fuzzy_rule(density %is% very_high && speed %is% fast, congestion %is% heavy),### These hashtags mean that I have added this rule myself
+  fuzzy_rule(density %is% very_high && speed %is% very_fast, congestion %is% moderate),###
+  fuzzy_rule(density %is% high && speed %is% very_slow, congestion %is% very_heavy),
+  fuzzy_rule(density %is% high && speed %is% slow, congestion %is% heavy),
+  fuzzy_rule(density %is% high && speed %is% medium, congestion %is% heavy),
+  fuzzy_rule(density %is% high && speed %is% fast, congestion %is% moderate),
+  fuzzy_rule(density %is% high && speed %is% very_fast, congestion %is% moderate),###
+  fuzzy_rule(density %is% medium && speed %is% very_slow, congestion %is% heavy),
+  fuzzy_rule(density %is% medium && speed %is% slow, congestion %is% moderate),
+  fuzzy_rule(density %is% medium && speed %is% medium, congestion %is% moderate),
+  fuzzy_rule(density %is% medium && speed %is% fast, congestion %is% moderate),
+  fuzzy_rule(density %is% medium && speed %is% very_fast, congestion %is% light),
+  fuzzy_rule(density %is% low && speed %is% very_slow, congestion %is% very_heavy),####
+  fuzzy_rule(density %is% low && speed %is% slow, congestion %is% moderate),
+  fuzzy_rule(density %is% low && speed %is% medium, congestion %is% light),
+  fuzzy_rule(density %is% low && speed %is% fast, congestion %is% light),
+  fuzzy_rule(density %is% low && speed %is% very_fast, congestion %is% very_light),
+  fuzzy_rule(density %is% very_low && speed %is% very_slow, congestion %is% very_heavy),###
+  fuzzy_rule(density %is% very_low && speed %is% slow, congestion %is% very_heavy),###
+  fuzzy_rule(density %is% very_low && speed %is% medium, congestion %is% light),
+  fuzzy_rule(density %is% very_low && speed %is% fast, congestion %is% very_light),
+  fuzzy_rule(density %is% very_low && speed %is% very_fast, congestion %is% very_light)
+)
+
+
+
+## Defining necessary functions
+
+#Making a 'not in' operator (Surprise tool that will help us later...)
+'%!in%' <- function(x,y)!('%in%'(x,y))
+
+# greenshields model with jam density=150 veh/km
+greenshield<-function(spelim,dens){
+  round((spelim)*(1-(dens/150)))
+}
+
+#Travel time and its penalty function
+trav <- function(v,a){
+  seglen[seglen[,"KITS.ID"]==a,"Length"]/v
+}
+
+travscale <- function(very_light,light,moderate,heavy,very_heavy){
+  if (length(very_light)==0){very_light=0}
+  if (length(light)==0){light=0}
+  if (length(moderate)==0){moderate=0}
+  if (length(heavy)==0){heavy=0}
+  if (length(very_heavy)==0){very_heavy=0}
+  1+(0.03*very_light+0.11*light+0.22*moderate+0.45*heavy+0.79*very_heavy)
+}
+
+
+#Fuel consumption and its penalty function
+# 6.35-ton (curb-weight) diesel truck (For now)
+fuel <-function(v,a){
+  ((871-16*v+0.143*v^2+32031*v^(-2)+1.79961*10^(-2)*9.58))*seglen[seglen[,"KITS.ID"]==a,"Length"] # 9.58 ton. #I gram/km (den anden er i kilogram!!!)
+}
+
+fuelscale <- function(very_light,light,moderate,heavy,very_heavy){
+  fc_vh=1.207 #Increase in fuel consumption at heavy congested state for HCV (Heavy Comercial Vehicle). (From India multi lane highway article)
+  if (length(very_light)==0){very_light=0}
+  if (length(light)==0){light=0}
+  if (length(moderate)==0){moderate=0}
+  if (length(heavy)==0){heavy=0}
+  if (length(very_heavy)==0){very_heavy=0}
+  1+round(((fc_vh*(3/79))*very_light+(fc_vh*(11/79))*light+(fc_vh*(22/79))*moderate+(fc_vh*(45/79))*heavy+fc_vh*very_heavy),3)
+}
+
+# fuel based objective function
+fuelobj <- function(v,a) {
+  c=round(conge,3)
+  very_light = gset_memberships(fuzzy_trapezoid_gset(c(con[1]-1,con[1],con[2],con[3]),universe=round(conseq,3))[c])
+  light = gset_memberships(fuzzy_triangular_gset(c(con[2],con[3],con[4]),universe=round(conseq,3))[c])
+  moderate = gset_memberships(fuzzy_triangular_gset(c(con[3],con[4],con[5]),universe=round(conseq,3))[c])
+  heavy = gset_memberships(fuzzy_triangular_gset(c(con[4],con[5],con[6]),universe=round(conseq,3))[c])
+  very_heavy = gset_memberships(fuzzy_trapezoid_gset(c(con[5],con[6],con[7],con[7]+1),universe=round(conseq,3))[c])
+  
+  fuelgon=fuel(v,a)
+  fsca=fuelscale(very_light,light,moderate,heavy,very_heavy)
+  fuelcom<-(fuelgon*fsca)
+  fuelcom
+}
+# fuel based benchmark function
+fuelbobj <- function(v,a){
+  fuelgon=fuel(v,a)
+  fuelgon
+}
+
+# travel time based objective function
+travobj <- function(v,a) {
+  c=round(conge,3)
+  very_light = gset_memberships(fuzzy_trapezoid_gset(c(con[1]-1,con[1],con[2],con[3]),universe=round(conseq,3))[c])
+  light = gset_memberships(fuzzy_triangular_gset(c(con[2],con[3],con[4]),universe=round(conseq,3))[c])
+  moderate = gset_memberships(fuzzy_triangular_gset(c(con[3],con[4],con[5]),universe=round(conseq,3))[c])
+  heavy = gset_memberships(fuzzy_triangular_gset(c(con[4],con[5],con[6]),universe=round(conseq,3))[c])
+  very_heavy = gset_memberships(fuzzy_trapezoid_gset(c(con[5],con[6],con[7],con[7]+1),universe=round(conseq,3))[c])
+  
+  travel=trav(v,a)*60*60 #seconds
+  tsca=travscale(very_light,light,moderate,heavy,very_heavy)
+  tratime<-(travel*tsca)
+  tratime
+}
+
+# travel time based benchmark function
+travbobj <- function(v,a){
+  travel=trav(v,a)*60*60 #Travel time 
+  travel
+}
+
+## For forecasting
+tens=function(a,t){
+  paus[paus$Time==t & paus$KITS.ID==a,"Density"]
+}
+spens=function(a,t){
+  paus[paus$Time==t & paus$KITS.ID==a,"Speed"]
+}
+ceng=function(a,t){
+  paus[paus$Time==t & paus$KITS.ID==a,"Congestion"]
+}
